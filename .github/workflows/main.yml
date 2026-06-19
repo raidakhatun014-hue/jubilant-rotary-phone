@@ -1,0 +1,316 @@
+"""
+Currency exchange app — Flask backend.
+
+Run with:
+    pip install -r requirements.txt
+    python app.py
+
+Then open http://localhost:5000
+"""
+
+import os
+import sqlite3
+from datetime import datetime
+
+from flask import Flask, jsonify, request, session, render_template
+from werkzeug.security import generate_password_hash, check_password_hash
+
+import db
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+
+STARTER_BALANCE = {"USD": 1000.00}
+
+
+# ---------- helpers ----------
+
+def current_user_id():
+    return session.get("user_id")
+
+
+def require_login():
+    if not current_user_id():
+        return jsonify({"error": "Not logged in"}), 401
+    return None
+
+
+def row_to_dict(row):
+    return dict(row) if row else None
+
+
+def get_currency(conn, code):
+    return conn.execute(
+        "SELECT * FROM currencies WHERE code = ?", (code,)
+    ).fetchone()
+
+
+def get_or_create_wallet(conn, user_id, currency_id):
+    wallet = conn.execute(
+        "SELECT * FROM wallets WHERE user_id = ? AND currency_id = ?",
+        (user_id, currency_id),
+    ).fetchone()
+    if wallet:
+        return wallet
+    conn.execute(
+        "INSERT INTO wallets (user_id, currency_id, balance) VALUES (?, ?, 0)",
+        (user_id, currency_id),
+    )
+    conn.commit()
+    return conn.execute(
+        "SELECT * FROM wallets WHERE user_id = ? AND currency_id = ?",
+        (user_id, currency_id),
+    ).fetchone()
+
+
+# ---------- pages ----------
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+# ---------- auth ----------
+
+@app.route("/api/register", methods=["POST"])
+def register():
+    data = request.get_json(force=True) or {}
+    username = (data.get("username") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    if len(username) < 3:
+        return jsonify({"error": "Username must be at least 3 characters."}), 400
+    if "@" not in email:
+        return jsonify({"error": "Enter a valid email address."}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters."}), 400
+
+    conn = db.get_conn()
+    try:
+        password_hash = generate_password_hash(password)
+        cur = conn.execute(
+            "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
+            (username, email, password_hash),
+        )
+        conn.commit()
+        user_id = cur.lastrowid
+
+        # Give every new user a wallet in each currency, with a starter
+        # USD balance so they can try an exchange immediately.
+        for currency in conn.execute("SELECT * FROM currencies").fetchall():
+            wallet = get_or_create_wallet(conn, user_id, currency["id"])
+            starter = STARTER_BALANCE.get(currency["code"])
+            if starter:
+                conn.execute(
+                    "UPDATE wallets SET balance = ? WHERE id = ?",
+                    (starter, wallet["id"]),
+                )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Username or email already taken."}), 409
+    finally:
+        conn.close()
+
+    session["user_id"] = user_id
+    session["username"] = username
+    return jsonify({"id": user_id, "username": username})
+
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.get_json(force=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+
+    conn = db.get_conn()
+    user = conn.execute(
+        "SELECT * FROM users WHERE username = ?", (username,)
+    ).fetchone()
+    conn.close()
+
+    if not user or not check_password_hash(user["password_hash"], password):
+        return jsonify({"error": "Invalid username or password."}), 401
+
+    session["user_id"] = user["id"]
+    session["username"] = user["username"]
+    return jsonify({"id": user["id"], "username": user["username"]})
+
+
+@app.route("/api/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/me")
+def me():
+    if not current_user_id():
+        return jsonify(None)
+    return jsonify({"id": current_user_id(), "username": session.get("username")})
+
+
+# ---------- reference data ----------
+
+@app.route("/api/currencies")
+def list_currencies():
+    conn = db.get_conn()
+    rows = conn.execute("SELECT * FROM currencies ORDER BY code").fetchall()
+    conn.close()
+    return jsonify([row_to_dict(r) for r in rows])
+
+
+@app.route("/api/rates")
+def list_rates():
+    conn = db.get_conn()
+    rows = conn.execute(
+        """
+        SELECT er.rate, er.updated_at,
+               fc.code AS from_code, tc.code AS to_code
+        FROM exchange_rates er
+        JOIN currencies fc ON fc.id = er.from_currency_id
+        JOIN currencies tc ON tc.id = er.to_currency_id
+        ORDER BY fc.code, tc.code
+        """
+    ).fetchall()
+    conn.close()
+    return jsonify([row_to_dict(r) for r in rows])
+
+
+# ---------- wallets ----------
+
+@app.route("/api/wallets")
+def list_wallets():
+    err = require_login()
+    if err:
+        return err
+    conn = db.get_conn()
+    rows = conn.execute(
+        """
+        SELECT w.id, w.balance, c.code, c.name, c.symbol
+        FROM wallets w
+        JOIN currencies c ON c.id = w.currency_id
+        WHERE w.user_id = ?
+        ORDER BY c.code
+        """,
+        (current_user_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([row_to_dict(r) for r in rows])
+
+
+# ---------- exchange ----------
+
+@app.route("/api/exchange", methods=["POST"])
+def exchange():
+    err = require_login()
+    if err:
+        return err
+
+    data = request.get_json(force=True) or {}
+    from_code = (data.get("from_currency") or "").upper()
+    to_code = (data.get("to_currency") or "").upper()
+    try:
+        amount = float(data.get("amount"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Enter a valid amount."}), 400
+
+    if amount <= 0:
+        return jsonify({"error": "Amount must be greater than zero."}), 400
+    if from_code == to_code:
+        return jsonify({"error": "Choose two different currencies."}), 400
+
+    conn = db.get_conn()
+    user_id = current_user_id()
+
+    from_currency = get_currency(conn, from_code)
+    to_currency = get_currency(conn, to_code)
+    if not from_currency or not to_currency:
+        conn.close()
+        return jsonify({"error": "Unknown currency."}), 400
+
+    rate_row = conn.execute(
+        "SELECT rate FROM exchange_rates WHERE from_currency_id = ? AND to_currency_id = ?",
+        (from_currency["id"], to_currency["id"]),
+    ).fetchone()
+    if not rate_row:
+        conn.close()
+        return jsonify({"error": "No exchange rate available for this pair."}), 400
+    rate = rate_row["rate"]
+
+    from_wallet = get_or_create_wallet(conn, user_id, from_currency["id"])
+    to_wallet = get_or_create_wallet(conn, user_id, to_currency["id"])
+
+    if from_wallet["balance"] < amount:
+        conn.close()
+        return jsonify({"error": f"Insufficient {from_code} balance."}), 400
+
+    received = round(amount * rate, 2)
+
+    try:
+        conn.execute(
+            "UPDATE wallets SET balance = balance - ? WHERE id = ?",
+            (amount, from_wallet["id"]),
+        )
+        conn.execute(
+            "UPDATE wallets SET balance = balance + ? WHERE id = ?",
+            (received, to_wallet["id"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO transactions
+                (user_id, from_wallet_id, to_wallet_id, from_currency_id, to_currency_id,
+                 amount_sent, amount_received, exchange_rate, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)
+            """,
+            (
+                user_id, from_wallet["id"], to_wallet["id"],
+                from_currency["id"], to_currency["id"],
+                amount, received, rate, datetime.utcnow().isoformat(),
+            ),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        conn.rollback()
+        conn.close()
+        return jsonify({"error": f"Transaction failed: {e}"}), 400
+
+    conn.close()
+    return jsonify({
+        "from_currency": from_code,
+        "to_currency": to_code,
+        "amount_sent": amount,
+        "amount_received": received,
+        "rate": rate,
+    })
+
+
+# ---------- transactions ----------
+
+@app.route("/api/transactions")
+def list_transactions():
+    err = require_login()
+    if err:
+        return err
+    conn = db.get_conn()
+    rows = conn.execute(
+        """
+        SELECT t.id, t.amount_sent, t.amount_received, t.exchange_rate,
+               t.status, t.created_at,
+               fc.code AS from_code, tc.code AS to_code
+        FROM transactions t
+        JOIN currencies fc ON fc.id = t.from_currency_id
+        JOIN currencies tc ON tc.id = t.to_currency_id
+        WHERE t.user_id = ?
+        ORDER BY t.created_at DESC
+        LIMIT 50
+        """,
+        (current_user_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([row_to_dict(r) for r in rows])
+
+
+if __name__ == "__main__":
+    db.init_db()
+    app.run(debug=True, port=5000)
